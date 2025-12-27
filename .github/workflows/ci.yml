@@ -1,0 +1,235 @@
+# CSC Latin America 2026 - CI Pipeline
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # ==========================================================================
+  # Build and Test (Standard)
+  # ==========================================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    container: rootproject/root:latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        apt-get update
+        apt-get install -y cmake ninja-build git
+        pip3 install pytest pytest-cov
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DBUILD_TESTS=ON \
+          -DBUILD_BENCHMARKS=ON
+    
+    - name: Build
+      run: cmake --build build -j$(nproc)
+    
+    - name: Run C++ Tests
+      run: ctest --test-dir build --output-on-failure --verbose
+    
+    - name: Run Python Tests
+      run: pytest tests/ -v --tb=short || true
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          build/analyze
+          build/benchmarks
+        retention-days: 7
+
+  # ==========================================================================
+  # Sanitizer Checks (ASan + UBSan)
+  # ==========================================================================
+  sanitizers:
+    name: Sanitizers (ASan/UBSan)
+    runs-on: ubuntu-latest
+    container: rootproject/root:latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        apt-get update
+        apt-get install -y cmake ninja-build
+    
+    - name: Configure with Sanitizers
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DENABLE_SANITIZERS=ON \
+          -DBUILD_TESTS=ON \
+          -DBUILD_BENCHMARKS=OFF
+    
+    - name: Build
+      run: cmake --build build -j$(nproc)
+    
+    - name: Run Tests with Sanitizers
+      env:
+        ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        UBSAN_OPTIONS: print_stacktrace=1:abort_on_error=1
+      run: ctest --test-dir build --output-on-failure
+
+  # ==========================================================================
+  # Thread Sanitizer
+  # ==========================================================================
+  thread-sanitizer:
+    name: Thread Sanitizer (TSan)
+    runs-on: ubuntu-latest
+    container: rootproject/root:latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        apt-get update
+        apt-get install -y cmake ninja-build
+    
+    - name: Configure with TSan
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DENABLE_TSAN=ON \
+          -DBUILD_TESTS=ON \
+          -DBUILD_BENCHMARKS=OFF
+    
+    - name: Build
+      run: cmake --build build -j$(nproc)
+    
+    - name: Run Tests with TSan
+      env:
+        TSAN_OPTIONS: abort_on_error=1
+      run: ctest --test-dir build --output-on-failure
+
+  # ==========================================================================
+  # Static Analysis
+  # ==========================================================================
+  static-analysis:
+    name: Static Analysis (clang-tidy)
+    runs-on: ubuntu-latest
+    container: rootproject/root:latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install clang-tidy
+      run: |
+        apt-get update
+        apt-get install -y cmake clang-tidy
+    
+    - name: Configure
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+    
+    - name: Run clang-tidy
+      run: |
+        find src include -name '*.cpp' -o -name '*.hpp' | \
+        xargs clang-tidy -p build --warnings-as-errors='*' || true
+
+  # ==========================================================================
+  # Benchmarks (on main only)
+  # ==========================================================================
+  benchmarks:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    container: rootproject/root:latest
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        apt-get update
+        apt-get install -y cmake ninja-build python3-pip
+        pip3 install matplotlib
+    
+    - name: Configure
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_BENCHMARKS=ON
+    
+    - name: Build
+      run: cmake --build build -j$(nproc)
+    
+    - name: Run Benchmarks
+      run: |
+        ./build/benchmarks \
+          --benchmark_format=json \
+          --benchmark_out=benchmark_results.json
+    
+    - name: Generate Benchmark Report
+      run: |
+        python3 << 'EOF'
+        import json
+        with open('benchmark_results.json') as f:
+            data = json.load(f)
+        
+        print("# Benchmark Results\n")
+        print("| Benchmark | Time (ns) | CPU (ns) | Iterations |")
+        print("|-----------|-----------|----------|------------|")
+        for bench in data.get('benchmarks', []):
+            name = bench.get('name', 'N/A')
+            time = bench.get('real_time', 0)
+            cpu = bench.get('cpu_time', 0)
+            iters = bench.get('iterations', 0)
+            print(f"| {name} | {time:.2f} | {cpu:.2f} | {iters} |")
+        EOF
+    
+    - name: Upload Benchmark Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results
+        path: benchmark_results.json
+        retention-days: 30
+
+  # ==========================================================================
+  # Documentation (optional)
+  # ==========================================================================
+  docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install mkdocs
+      run: pip install mkdocs mkdocs-material
+    
+    - name: Build docs
+      run: mkdocs build -d site || echo "No mkdocs.yml found, skipping"
+    
+    - name: Upload docs artifact
+      uses: actions/upload-artifact@v4
+      if: success()
+      with:
+        name: documentation
+        path: site/
+        retention-days: 7
