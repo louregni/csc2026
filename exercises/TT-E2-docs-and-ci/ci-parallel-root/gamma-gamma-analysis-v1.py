@@ -20,7 +20,7 @@ if len(sys.argv) >= 3:
     try:
         max_events = int(sys.argv[2])
     except ValueError:
-        max_events = 0
+        max_events = 20000
 
 start = time.time()
 
