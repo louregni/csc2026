@@ -1,0 +1,177 @@
+name: Process ATLAS ROOT Open Data v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      data_file:
+        description: "Repo path to newline-separated ROOT URLs"
+        default: "exercises/TT-E2-docs-and-ci/ci-parallel-root/data.csv"
+        required: true
+      max_events:
+        description: "Optional max events per file (0 = all)"
+        default: "0"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  WORKDIR: exercises/TT-E2-docs-and-ci/ci-parallel-root
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      files: ${{ steps.read_file.outputs.files }}
+      data_file_name: ${{ steps.extract_name.outputs.data_file_name }}
+      max_events: ${{ steps.max_events.outputs.max_events }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Capture max_events input
+        id: max_events
+        run: |
+          echo "max_events=${{ github.event.inputs.max_events }}" >> "$GITHUB_OUTPUT"
+
+      - name: Read CSV File and Prepare Jobs
+        id: read_file
+        run: |
+          # Read lines, drop empty lines + comments, output JSON array
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib, os
+          ws = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          p = ws / "${{ github.event.inputs.data_file }}"
+          lines = []
+          for raw in p.read_text().splitlines():
+            s = raw.strip()
+            if not s or s.startswith("#"):
+              continue
+            lines.append(s)
+          print("files=" + json.dumps(lines))
+          PY
+
+      - name: Extract Data File Name
+        id: extract_name
+        run: |
+          data_file_name=$(basename "${{ github.event.inputs.data_file }}" .csv)
+          echo "data_file_name=$data_file_name" >> "$GITHUB_OUTPUT"
+
+  process-file:
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        file: ${{ fromJSON(needs.setup.outputs.files) }}
+    outputs:
+      data_file_name: ${{ needs.setup.outputs.data_file_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run ROOT Script in Docker
+        uses: addnab/docker-run-action@v3
+        with:
+          image: rootproject/root:latest
+          options: --rm -v ${{ github.workspace }}:/workspace -w /workspace/${{ env.WORKDIR }}
+          run: |
+            python3 gamma-gamma-analysis-v1.py "${{ matrix.file }}" "${{ needs.setup.outputs.max_events }}"
+
+      - name: Commit and Push Histogram Plot
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          cd "${{ env.WORKDIR }}"
+
+          if ls plots/histogram_*.png plots/histogram_*.root 1> /dev/null 2>&1; then
+            git add plots/histogram_*.png plots/histogram_*.root
+            git diff --cached --exit-code || git commit -m "Add updated histogram plot" --allow-empty
+          else
+            echo "No plot generated"
+          fi
+
+          # Rebase then push to the SAME branch the workflow runs on
+          git fetch origin "${GITHUB_REF_NAME}"
+          git stash push -m "Stash uncommitted changes for rebase" || true
+          git rebase "origin/${GITHUB_REF_NAME}" || (git rebase --abort; git pull --rebase origin "${GITHUB_REF_NAME}")
+          git stash pop || true
+          git push --force-with-lease origin "HEAD:${GITHUB_REF_NAME}"
+
+  merge-root-files:
+    needs: [setup, process-file]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify .root Files
+        run: |
+          echo "Listing all .root files in plots directory:"
+          ls -lh "${{ env.WORKDIR }}/plots/"*.root || echo "No .root files found"
+
+      - name: Merge ROOT files with hadd (Docker)
+        uses: addnab/docker-run-action@v3
+        with:
+          image: rootproject/root:latest
+          options: --rm -v ${{ github.workspace }}:/workspace -w /workspace/${{ env.WORKDIR }}/plots
+          run: |
+            hadd -f "merged_histograms_${{ needs.setup.outputs.data_file_name }}.root" histogram_*.root
+
+      - name: Commit and Push Merged ROOT File
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git add "${{ env.WORKDIR }}/plots/merged_histograms_${{ needs.setup.outputs.data_file_name }}.root" || true
+          git diff --cached --exit-code || git commit -m "Add merged ROOT file" --allow-empty
+
+          git fetch origin "${GITHUB_REF_NAME}"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push --force-with-lease origin "HEAD:${GITHUB_REF_NAME}"
+
+  generate-png:
+    needs: [setup, merge-root-files]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run root-to-png.py in Docker
+        uses: addnab/docker-run-action@v3
+        with:
+          image: rootproject/root:latest
+          options: --rm -v ${{ github.workspace }}:/workspace -w /workspace/${{ env.WORKDIR }}
+          run: |
+            python3 root-to-png.py "plots/merged_histograms_${{ needs.setup.outputs.data_file_name }}.root"
+
+      - name: Commit and Push Merged PNG File
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git add "${{ env.WORKDIR }}/plots/merged_histograms_${{ needs.setup.outputs.data_file_name }}.png" || true
+          git diff --cached --exit-code || git commit -m "Add merged histogram as PNG" --allow-empty
+
+          git fetch origin "${GITHUB_REF_NAME}"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push --force-with-lease origin "HEAD:${GITHUB_REF_NAME}"
