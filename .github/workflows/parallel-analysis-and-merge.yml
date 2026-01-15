@@ -94,6 +94,7 @@ jobs:
         with:
           image: ${{ env.ROOT_IMAGE }}
           options: --rm -v ${{ github.workspace }}:/workspace
+          shell: bash
           run: |
             set -e
             cd /workspace/${{ env.EX_DIR }}
@@ -139,6 +140,7 @@ jobs:
         with:
           image: ${{ env.ROOT_IMAGE }}
           options: --rm -v ${{ github.workspace }}:/workspace
+          shell: bash
           run: |
             set -e
             cd /workspace/${{ env.EX_DIR }}/plots
@@ -159,6 +161,7 @@ jobs:
         with:
           image: ${{ env.ROOT_IMAGE }}
           options: --rm -v ${{ github.workspace }}:/workspace
+          shell: bash
           run: |
             set -e
             cd /workspace/${{ env.EX_DIR }}
